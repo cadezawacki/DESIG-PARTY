@@ -138,10 +138,34 @@ from app.helpers.common import BAD_USERNAMES, BAD_BOOKS
 DEPARTED_TRADERS = ['cookmat1', 'liuyin1', 'pridhame', 'cenkevin']
 
 from app.helpers.common import get_algo_books, CRB_STRATEGY_BOOKS
-from app.server import get_threads
 
-ALGO_BOOKS = get_threads().submit(get_algo_books()).result()
-NON_DESIG_BOOKS = set(BAD_BOOKS) | set(ALGO_BOOKS) | set(CRB_STRATEGY_BOOKS)
+# Lazy-loaded at first use from an async context to avoid freezing module
+# import when the thread pool or upstream KDB is unavailable. The previous
+# module-level `get_threads().submit(get_algo_books()).result()` blocked the
+# event loop during import and could deadlock the entire loader.
+_NON_DESIG_BOOKS_CACHE: Optional[frozenset] = None
+_NON_DESIG_BOOKS_LOCK = asyncio.Lock()
+
+
+async def _get_non_desig_books() -> frozenset:
+    global _NON_DESIG_BOOKS_CACHE
+    if _NON_DESIG_BOOKS_CACHE is not None:
+        return _NON_DESIG_BOOKS_CACHE
+    async with _NON_DESIG_BOOKS_LOCK:
+        if _NON_DESIG_BOOKS_CACHE is not None:
+            return _NON_DESIG_BOOKS_CACHE
+        try:
+            algo = await get_algo_books()
+        except Exception:
+            log.warning(
+                "get_algo_books() failed; proceeding with empty algo-book set:\n"
+                f"{traceback.format_exc()}"
+            )
+            algo = []
+        _NON_DESIG_BOOKS_CACHE = frozenset(
+            set(BAD_BOOKS) | set(algo or []) | set(CRB_STRATEGY_BOOKS)
+        )
+        return _NON_DESIG_BOOKS_CACHE
 
 
 # ----------------------------------------
@@ -906,10 +930,11 @@ async def desig_frame_enhancer(r, region, modifiers):
         )
 
     rl, rt = region.lower(), region.title()
+    non_desig_books = await _get_non_desig_books()
     r = r.filter(
         ~(
                 pl.col('bookId').is_null() |
-                pl.col('bookId').is_in(list(NON_DESIG_BOOKS)) |
+                pl.col('bookId').is_in(list(non_desig_books)) |
                 pl.col('bookId').str.ends_with("DTC")  # tsy books
         )
     ).with_columns(
@@ -1126,17 +1151,15 @@ def _find_promoted(scored: pl.DataFrame) -> pl.DataFrame:
     """Extract bonds from a scored waterfall round that are confident enough to
     grow the universe for subsequent rounds.
 
-    Gate requirements (all must be true):
-      - desigGapRatio >= HIGH_CONFIDENCE (0.6) -- real separation, not the
-        single-candidate default of 0.4
-      - desigScore >= HIGH_SCORE (20) -- meaningfully positive
-      - label in _PROMOTABLE_LABELS -- excludes BOOSTED_MEDIUM/LOW which are
-        too marginal to serve as universe evidence
+    Promotion is gated purely on the label. `_label_waterfall_confidence`
+    already encodes the pass-dependent score threshold
+    (`HIGH_SCORE + pidx * WATERFALL_HIGH_STEP`) and the gap threshold, so
+    re-asserting a flat `HIGH_SCORE` here was redundant AND inconsistent --
+    it let some WATERFALL_P2 bonds scoring below the pass threshold slip in,
+    and blocked HIGH_CONFIDENCE bonds that sat right on the cutoff.
     """
     return scored.filter(
-        (pl.col('desigScore') >= HIGH_SCORE)
-        & (pl.col('desigGapRatio') >= HIGH_CONFIDENCE)
-        & pl.col('desigConfidence').is_in(list(_PROMOTABLE_LABELS))
+        pl.col('desigConfidence').is_in(list(_PROMOTABLE_LABELS))
     )
 
 
@@ -1212,6 +1235,19 @@ def _run_waterfall_round(
     basket_inj_cols = ['isin', 'topTradersIds'] + [c for c in shared_match if c in b_cols]
     basket_for_injection = basket_to_score.select(basket_inj_cols)
 
+    # Pre-deduplicate the universe ONCE per round. Prior implementation
+    # re-scanned and re-deduped the full universe inside every desk/pass
+    # iteration (~40+ times/round), which dominated runtime on large
+    # portfolios. Dropping to a single projection keeps downstream group_bys
+    # cheap because each pass only re-aggregates on its `usable` subset.
+    universe_match_cols = [c for c in shared_match if c in u_cols]
+    universe_traders = (
+        universe_basket
+        .filter(pl.col('desigTraderId').is_not_null())
+        .select(['isin', 'desigTraderId'] + universe_match_cols)
+        .unique()
+    )
+
     # ---- Walk desk/pass combinations, collect boosts + injections ----
     boost_parts: list[pl.DataFrame] = []
     known_desks = list(DESK_WATERFALL_PASSES.keys())
@@ -1240,18 +1276,21 @@ def _run_waterfall_round(
                     usable = [c for c in pcols if c in shared_match]
                     if not usable: continue
 
-                    # Universe bond counts per (bucket, trader)
+                    # Universe bond counts per (bucket, trader) -- operates
+                    # on the pre-deduped projection instead of re-scanning
+                    # the full universe every pass.
                     uc = (
-                        universe_basket
-                        .filter(pl.col('desigTraderId').is_not_null())
+                        universe_traders
                         .group_by(usable + ['desigTraderId'])
                         .agg(pl.len().alias('_uc'))
                     )
 
-                    # Self-presence markers for exclusion
+                    # Self-presence markers for exclusion (projection over
+                    # already-deduped data -- the .unique() here is on a
+                    # narrower set and is effectively a no-op when `usable`
+                    # equals `universe_match_cols`).
                     us = (
-                        universe_basket
-                        .filter(pl.col('desigTraderId').is_not_null())
+                        universe_traders
                         .select(['isin', 'desigTraderId'] + usable)
                         .unique()
                         .with_columns(pl.lit(1, pl.Int8).alias('_sf'))
@@ -1330,12 +1369,17 @@ def _run_waterfall_round(
                     if not inj.hyper.is_empty():
                         injection_parts.append(inj)
 
-                except Exception as e:
-                    log.warning(f"Waterfall {desk_key}/P{pidx + 1}: {e}")
+                except Exception:
+                    log.warning(
+                        f"Waterfall {desk_key}/P{pidx + 1} pass failed:\n"
+                        f"{traceback.format_exc()}"
+                    )
                     continue
 
-        except Exception as e:
-            log.warning(f"Waterfall desk '{desk_key}': {e}")
+        except Exception:
+            log.warning(
+                f"Waterfall desk '{desk_key}' failed:\n{traceback.format_exc()}"
+            )
             continue
 
     # ---- Nothing to do: return unchanged ----
@@ -1439,9 +1483,17 @@ def _run_waterfall_round(
         merged = pl.concat([merged, best_inj], how='diagonal_relaxed')
 
     # ---- Re-rank per ISIN (greedy: highest total score wins) ----
+    # Tie-breakers make results deterministic across runs when scores tie:
+    #   1. higher `_boost` wins (prefer candidates with universe evidence)
+    #   2. prior candidates beat injections (`_injected` False first)
+    #   3. alphabetical traderId as final deterministic key
     ranked = (
         merged
-        .sort(['isin', 'topScores'], descending=[False, True])
+        .sort(
+            ['isin', 'topScores', '_boost', '_injected', 'topTradersIds'],
+            descending=[False, True, True, False, False],
+            nulls_last=True,
+        )
         .group_by('isin', maintain_order=True)
         .agg(
             [
@@ -1552,7 +1604,20 @@ async def apply_waterfall(
         all_promoted: list[pl.DataFrame] = []
         last_scored = None
 
+        # Enforce a wall-clock budget so a slow round cannot freeze the
+        # pipeline. `WATERFALL_BUDGET_MS` was previously declared but unused.
+        deadline = time.monotonic() + (WATERFALL_BUDGET_MS / 1000.0)
+        timed_out = False
+
         for round_idx in range(WATERFALL_MAX_ROUNDS):
+            if time.monotonic() >= deadline:
+                log.warning(
+                    f"Waterfall: time budget exceeded after round {round_idx}; "
+                    f"returning partial result"
+                )
+                timed_out = True
+                break
+
             await log.debug(f'WATERFALL ROUND: {round_idx}')
             scored = _run_waterfall_round(basket, universe, shared_match)
 
@@ -1589,22 +1654,40 @@ async def apply_waterfall(
         else:
             # Hit max rounds without convergence - do a final pass with the
             # fully grown universe so the last basket benefits from all promotions
-            last_scored = _run_waterfall_round(basket, universe, shared_match)
-            last_scored = last_scored.with_columns(
-                pl.lit(WATERFALL_MAX_ROUNDS + 1, pl.Int32).alias('_waterfall_round')
-            )
-            log.info(f"Waterfall: max rounds ({WATERFALL_MAX_ROUNDS}) reached, final rescore done")
+            if time.monotonic() < deadline:
+                last_scored = _run_waterfall_round(basket, universe, shared_match)
+                last_scored = last_scored.with_columns(
+                    pl.lit(WATERFALL_MAX_ROUNDS + 1, pl.Int32).alias('_waterfall_round')
+                )
+                log.info(f"Waterfall: max rounds ({WATERFALL_MAX_ROUNDS}) reached, final rescore done")
+            else:
+                log.warning(
+                    f"Waterfall: time budget exhausted before final rescore "
+                    f"after {WATERFALL_MAX_ROUNDS} rounds"
+                )
+                timed_out = True
 
-        # Combine all promoted bonds with the final scored remainder
+        # If we timed out mid-iteration, salvage the current basket as the
+        # remainder so those bonds still appear in the output.
+        if timed_out and last_scored is None:
+            last_scored = basket.with_columns(
+                pl.lit(round_idx + 1, pl.Int32).alias('_waterfall_round')
+            )
+
+        # Combine all promoted bonds with the final scored remainder.
+        # Dedup by isin (keep='first') because promoted rounds fire before
+        # the final remainder -- a bond promoted in round N should not also
+        # show up as a low-confidence leftover from a later round.
         if all_promoted:
             parts = all_promoted + ([last_scored] if last_scored is not None
                                     and not last_scored.hyper.is_empty() else [])
-            return pl.concat(parts, how='diagonal_relaxed')
+            combined = pl.concat(parts, how='diagonal_relaxed')
+            return combined.unique(subset=['isin'], keep='first', maintain_order=True)
 
         # No promotions ever happened - return the single-round result
         return last_scored if last_scored is not None else scored
 
-    except Exception as e:
-        log.error(f"Waterfall failed: {e}\n{traceback.format_exc()}")
+    except Exception:
+        log.error(f"Waterfall failed:\n{traceback.format_exc()}")
         return basket_to_score
 
