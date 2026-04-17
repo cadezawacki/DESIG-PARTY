@@ -79,13 +79,19 @@ SGP_MARKET_HOURS_END_UTC = 21  # 21:00 UTC = ~05:00 SGT next day
 #
 # Format: {desk_asset: [(min_score, [matching_columns]), ...]}
 DESK_WATERFALL_PASSES: Dict[str, List[Tuple[float, List[str]]]] = {
+    # IG desks are much more curve-structured than HY/EM -- a trader
+    # who's the desig for 5Y Industrials USD is very likely the desig
+    # for 10Y Industrials USD too. Weight curve-containing passes more
+    # heavily and add a curve-focused pass so curve match contributes
+    # even when industryGroup or ratingAssetClass disagrees.
     'IG': [
-        (10.0, ['ticker', 'ratingAssetClass', 'issuerCountry', 'yieldCurvePosition', 'industryGroup', 'currency']),
-        (8.0, ['ticker', 'ratingAssetClass', 'issuerCountry', 'yieldCurvePosition', 'currency']),
-        (6.0, ['ticker', 'ratingAssetClass', 'issuerCountry', 'currency']),
-        (4.0, ['ticker', 'issuerCountry', 'currency']),
-        (2.5, ['ticker', 'currency']),
-        (1.5, ['ticker']),
+        (14.0, ['ticker', 'ratingAssetClass', 'issuerCountry', 'yieldCurvePosition', 'industryGroup', 'currency']),
+        (11.0, ['ticker', 'ratingAssetClass', 'issuerCountry', 'yieldCurvePosition', 'currency']),
+        (9.0,  ['ticker', 'yieldCurvePosition', 'currency']),
+        (6.0,  ['ticker', 'ratingAssetClass', 'issuerCountry', 'currency']),
+        (4.0,  ['ticker', 'issuerCountry', 'currency']),
+        (2.5,  ['ticker', 'currency']),
+        (1.5,  ['ticker']),
     ],
     'HY': [
         (8.0, ['ticker', 'ratingAssetClass', 'issuerCountry', 'currency']),
@@ -1100,6 +1106,48 @@ async def rank_scored_frame(r):
 # -- Waterfall Superscoring
 # ----------------------------------------------------------------
 
+async def _ensure_eager(df):
+    """Collect a LazyFrame to a DataFrame; no-op if already eager.
+
+    Used at waterfall round boundaries to prevent lazy plans from
+    accumulating across rounds. Before this guard, round 3 would
+    materialize all three rounds' work in a single call and freeze the
+    event loop for 50+ seconds on a 100-bond portfolio.
+    """
+    if df is None:
+        return None
+    if isinstance(df, pl.LazyFrame):
+        return await df.collect_async()
+    return df
+
+
+async def _run_waterfall_round_threaded(basket, universe, shared_match):
+    """Run the sync Polars `_run_waterfall_round` on a worker thread.
+
+    `_run_waterfall_round` is pure CPU-bound Polars work with no IO, so
+    it's safe to offload. Running it inline from the event loop blocks
+    every other async task for the duration of the round (KDB callbacks,
+    heartbeats, other data-loader tasks) -- which is how a slow
+    waterfall manifested as a whole-process freeze rather than just
+    slow desig assignment.
+
+    Falls back to inline execution if the thread pool is unavailable
+    (e.g., app.server hasn't initialized get_threads() yet).
+    """
+    try:
+        from app.server import get_threads
+        fut = get_threads().submit(
+            _run_waterfall_round, basket, universe, shared_match,
+        )
+        return await asyncio.wrap_future(fut)
+    except Exception:
+        log.warning(
+            "Waterfall: thread offload unavailable; running inline "
+            f"(event loop will block for this round):\n{traceback.format_exc()}"
+        )
+        return _run_waterfall_round(basket, universe, shared_match)
+
+
 def _label_waterfall_confidence(ranked: pl.DataFrame) -> pl.DataFrame:
     """Apply confidence labels to waterfall-scored bonds (pass-dependent thresholds)."""
     boosted = pl.col('_best_boost').fill_null(0.0) > 0
@@ -1598,6 +1646,19 @@ async def apply_waterfall(
             log.warning("Waterfall: no shared matching columns, returning unchanged")
             return basket_to_score
 
+        # ---- Eager-materialize inputs ----
+        # The caller (desig_waterfall_portfolio) hands us LazyFrames. If
+        # we let _run_waterfall_round build on top of lazy inputs, every
+        # round's .filter/.join/.group_by is appended to the plan instead
+        # of executed. Rounds 1-2 appear fast because their .is_empty()
+        # checks only collect what's pending so far -- but by round 3 the
+        # plan is 3 rounds deep and the final collection takes the 50+
+        # seconds we're seeing, with the event loop blocked the entire
+        # time. Forcing eager DataFrames now + at every round boundary
+        # keeps each collection bounded to a single round's work.
+        basket_to_score = await _ensure_eager(basket_to_score)
+        universe_basket = await _ensure_eager(universe_basket)
+
         # ---- Iterative cascading ----
         universe = universe_basket
         basket = basket_to_score
@@ -1619,12 +1680,18 @@ async def apply_waterfall(
                 break
 
             await log.debug(f'WATERFALL ROUND: {round_idx}')
-            scored = _run_waterfall_round(basket, universe, shared_match)
+            # Run the sync Polars work in a worker thread so a slow
+            # round doesn't block the event loop. Other async tasks
+            # (KDB callbacks, heartbeats, data loads) stay responsive.
+            scored = await _run_waterfall_round_threaded(
+                basket, universe, shared_match,
+            )
 
-            # Tag which round scored these bonds
+            # Tag which round scored these bonds; materialize the result.
             scored = scored.with_columns(
                 pl.lit(round_idx + 1, pl.Int32).alias('_waterfall_round')
             )
+            scored = await _ensure_eager(scored)
 
             # Identify newly promoted bonds
             promoted = _find_promoted(scored)
@@ -1639,11 +1706,15 @@ async def apply_waterfall(
 
             all_promoted.append(promoted)
 
-            # Grow universe with promoted bonds
-            universe = pl.concat([universe, promoted], how='diagonal_relaxed')
+            # Grow universe with promoted bonds -- eagerly, so the next
+            # round doesn't inherit a concat LazyFrame plan.
+            universe = await _ensure_eager(
+                pl.concat([universe, promoted], how='diagonal_relaxed')
+            )
 
-            # Shrink basket: remove promoted ISINs
+            # Shrink basket: remove promoted ISINs.
             remaining = scored.filter(~pl.col('isin').is_in(promoted_isins))
+            remaining = await _ensure_eager(remaining)
 
             if remaining.hyper.is_empty():
                 log.info(f"Waterfall round {round_idx + 1}: basket fully resolved")
@@ -1655,10 +1726,13 @@ async def apply_waterfall(
             # Hit max rounds without convergence - do a final pass with the
             # fully grown universe so the last basket benefits from all promotions
             if time.monotonic() < deadline:
-                last_scored = _run_waterfall_round(basket, universe, shared_match)
+                last_scored = await _run_waterfall_round_threaded(
+                    basket, universe, shared_match,
+                )
                 last_scored = last_scored.with_columns(
                     pl.lit(WATERFALL_MAX_ROUNDS + 1, pl.Int32).alias('_waterfall_round')
                 )
+                last_scored = await _ensure_eager(last_scored)
                 log.info(f"Waterfall: max rounds ({WATERFALL_MAX_ROUNDS}) reached, final rescore done")
             else:
                 log.warning(
@@ -1673,6 +1747,7 @@ async def apply_waterfall(
             last_scored = basket.with_columns(
                 pl.lit(round_idx + 1, pl.Int32).alias('_waterfall_round')
             )
+            last_scored = await _ensure_eager(last_scored)
 
         # Combine all promoted bonds with the final scored remainder.
         # Dedup by isin (keep='first') because promoted rounds fire before
@@ -1682,6 +1757,7 @@ async def apply_waterfall(
             parts = all_promoted + ([last_scored] if last_scored is not None
                                     and not last_scored.hyper.is_empty() else [])
             combined = pl.concat(parts, how='diagonal_relaxed')
+            combined = await _ensure_eager(combined)
             return combined.unique(subset=['isin'], keep='first', maintain_order=True)
 
         # No promotions ever happened - return the single-round result

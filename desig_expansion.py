@@ -66,7 +66,7 @@ from typing import Optional
 import polars as pl
 
 from app.helpers.common import BAD_BOOKS, BAD_USERNAMES
-from app.helpers.date_helpers import latest_biz_date
+from app.helpers.date_helpers import get_today, latest_biz_date
 from app.helpers.generic_helpers import L1_DESK_MAP
 from app.helpers.q_helpers import kdb_convert_series_to_sym
 from app.logs.logging import log
@@ -94,6 +94,15 @@ def _late_waterfall():
 
 REGIONS = ("US", "EU", "SGP")
 
+# Hard cap on firm-wide desig rows pulled per region. PANOPROXY with
+# `desig=1` is already narrow (~single-digit thousands of rows on a
+# normal book), but a misconfigured filter -- say, a NULL ticker slipping
+# through, or an unusually large firm footprint -- could balloon the
+# universe and make the downstream waterfall do enormous joins. Cap +
+# sort by amountOutstanding DESC as a liquidity proxy so we keep the
+# most-traded bonds if we have to truncate. 0 disables the cap.
+MAX_EXPANSION_ROWS_PER_REGION = 2500
+
 # Output columns expected by `apply_waterfall` on its `universe_basket` arg.
 _UNIVERSE_OUTPUT_COLS = [
     'isin', 'desigTraderId', 'desigBookId', 'desigName', 'desigRegion',
@@ -113,7 +122,10 @@ async def _firm_wide_desigs_one_region(region: str, dates):
 
     Modeled on `pano_positions` (kdb_queries_dev_v3.py:5409) but simpler
     -- no funges, no historical lookback, no per-portfolio ISIN filter.
-    The `desig=1` predicate is what keeps the result tiny.
+    The `desig=1` predicate is what keeps the result tiny. A defensive
+    `not null ticker` filter stops a data glitch (ticker left unset on
+    some position) from contributing a giant NULL-ticker bucket to the
+    downstream waterfall.
     """
     _, build_pt_query, _, _, _ = _late_imports()
     triplet = construct_panoproxy_triplet(region, 'bondpositions', dates)
@@ -122,6 +134,7 @@ async def _firm_wide_desigs_one_region(region: str, dates):
         'netPosition:position',
         'traderId:lower[traderId]',
         'deskType',
+        'amountOutstanding',
     ]
     cols = kdb_col_select_helper(cols, "last")
     q = build_pt_query(
@@ -130,19 +143,41 @@ async def _firm_wide_desigs_one_region(region: str, dates):
         filters={'desig': 1},
         by=['isin:securityAltId3', 'bookId'],
     )
-    # Drop known-bad books at the KDB layer to cut the result set.
+    # Defensive filters: drop bad books and rows with a null ticker
+    # symbol (which would otherwise cross-match every basket bond with
+    # null ticker in the waterfall's group_by).
     q += ',(not bookId in (%s))' % kdb_convert_series_to_sym(BAD_BOOKS)
+    q += ',(not null ticker)'
     pano_region = "US" if region == "SGP" else region
     r = await query_kdb(q, fconn(PANOPROXY, region=pano_region))
     if r is None or r.hyper.is_empty():
         return None
-    return r.with_columns([
+    out = r.with_columns([
         pl.lit(region, pl.String).alias('bookRegion'),
         pl.col('netPosition').cast(pl.Float64, strict=False).fill_null(0),
         pl.col('deskType').replace_strict(
             L1_DESK_MAP, default="OTHER", return_dtype=pl.String,
         ).alias("deskAsset"),
     ])
+
+    # Liquidity-proxy truncation: keep the top-N most-issued bonds per
+    # region. amountOutstanding is a cheap, stable ranking signal.
+    if MAX_EXPANSION_ROWS_PER_REGION and out.hyper.height() > MAX_EXPANSION_ROWS_PER_REGION:
+        before = out.hyper.height()
+        out = (
+            out
+            .sort(
+                ['amountOutstanding', 'netPosition'],
+                descending=[True, True],
+                nulls_last=True,
+            )
+            .head(MAX_EXPANSION_ROWS_PER_REGION)
+        )
+        log.info(
+            f"firm_wide_desigs[{region}]: truncated {before} -> "
+            f"{MAX_EXPANSION_ROWS_PER_REGION} rows by amountOutstanding"
+        )
+    return out
 
 
 def _firm_wide_desigs_cached():
@@ -219,6 +254,23 @@ async def _firm_wide_refdata_impl(isins, dates):
     return await query_kdb(q, fconn(GATEWAY))
 
 
+# yieldCurvePosition bucket boundaries. Mirror the helper at
+# kdb_queries_dev_v3.py:876 (`yield_curve_position(maturity)`), which
+# uses Front-end / Intermediate / Long-end splits at 4y / 10y.
+# Implemented as a Polars expression so we can vectorize over the full
+# refdata frame without Python-level `.map()` overhead.
+def _curve_position_expr(yrs_to_maturity: pl.Expr) -> pl.Expr:
+    return (
+        pl.when(yrs_to_maturity.is_null())
+          .then(pl.lit(None, pl.String))
+          .when(yrs_to_maturity <= 4.0)
+          .then(pl.lit('Front-end', pl.String))
+          .when(yrs_to_maturity <= 10.0)
+          .then(pl.lit('Intermediate', pl.String))
+          .otherwise(pl.lit('Long-end', pl.String))
+    )
+
+
 def _firm_wide_refdata_cached():
     hypercache, *_ = _late_imports()
 
@@ -234,10 +286,23 @@ def _firm_wide_refdata_cached():
         r = await _firm_wide_refdata_impl(isins, dates)
         if r is None or r.hyper.is_empty():
             return None
+        # maturityDate -> yrsToMaturity -> yieldCurvePosition. The
+        # waterfall (esp. IG passes) treats curve position as a primary
+        # match column, so populating it on expansion rows is what lets
+        # a LOW IG bond's sibling-curve desigs boost each other.
+        today_expr = pl.lit(get_today(), pl.Date)
+        yrs_expr = (
+            (pl.col('maturityDate').cast(pl.Date, strict=False) - today_expr)
+            .dt.total_days()
+            .cast(pl.Float64, strict=False) / 365.25
+        )
         return r.with_columns([
             pl.col('ratingCombined')
               .replace(RATING_MAP_SIMPLE)
               .alias('ratingAssetClass'),
+            yrs_expr.alias('yrsToMaturity'),
+        ]).with_columns([
+            _curve_position_expr(pl.col('yrsToMaturity')).alias('yieldCurvePosition'),
         ])
 
     return _impl
