@@ -573,19 +573,60 @@ ref_data_tasks = [
             'topRegions'   : pl.List(pl.String),
         },
     ),
-    # todo: expand universe using LOW, for not just join low
-    # DataTask(
-    #     task_name='desig_expander',
-    #     broadcast_name="Desigs",
-    #     func=desig_expander,
-    #     merge_key='isin',
-    #     strict_task_requirements=['desig_splitter_low'],
-    #     fromFrame='main',
-    #     frameContext=['desig_low'],
-    #     toFrame='desig_low',
-    #     isOptional=True,
-    #     critical_columns=['desigName']
-    # ),
+    # ----------------------------------------------------------------
+    # Expanded universe: second waterfall round against firm-wide KDB
+    # evidence. Produces desigs for LOW/VERY_LOW bonds the portfolio
+    # round couldn't resolve, but never overwrites portfolio HIGH/P1/P2.
+    # See desig_expansion.py for the design rationale.
+    # ----------------------------------------------------------------
+    DataTask(
+        task_name='desig_expander',
+        broadcast_name="Desigs - Expanded Universe",
+        func=desig_expander,
+        merge_key='isin',
+        strict_task_requirements=['desig_splitter_low'],
+        fromFrame='main',
+        frameContext=['desig_low', 'desig_joined'],
+        toFrame='desig_expanded',
+        isOptional=True,
+        use_cached_providers=False,
+        expected_col_provides={
+            'desigBookId'    : pl.String,
+            'desigTraderId'  : pl.String,
+            'desigName'      : pl.String,
+            'desigRegion'    : pl.String,
+            'desigConfidence': pl.String,
+            'desigGapRatio'  : pl.Float64,
+            'desigScore'     : pl.Float64,
+            'deskAsset'      : pl.String,
+            'topTradersIds'  : pl.List(pl.String),
+            'topScores'      : pl.List(pl.Float64),
+            'topBooks'       : pl.List(pl.String),
+            'topNames'       : pl.List(pl.String),
+            'topRegions'     : pl.List(pl.String),
+        },
+    ),
+    DataTask(
+        task_name='desig_expanded_splitter',
+        broadcast_name="Desigs - Expanded Splitter",
+        func=desig_expanded_splitter,
+        merge_key='isin',
+        strict_task_requirements=['desig_expander'],
+        fromFrame='main',
+        frameContext=['desig_expanded', 'desig_joined'],
+        isOptional=True,
+        use_cached_providers=False,
+        expected_col_provides={
+            'desigBookId'    : pl.String,
+            'desigTraderId'  : pl.String,
+            'desigName'      : pl.String,
+            'desigRegion'    : pl.String,
+            'desigConfidence': pl.String,
+            'desigGapRatio'  : pl.Float64,
+            'desigScore'     : pl.Float64,
+            'deskAsset'      : pl.String,
+        },
+    ),
 ]
 
 funge_tasks = [

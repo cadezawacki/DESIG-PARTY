@@ -6167,41 +6167,28 @@ async def desig_splitter_low(my_pt, region="US", dates=None, frames=None, **kwar
     _COMPLETE_LABELS = set(['HIGH_CONFIDENCE'] + list(_PROMOTABLE_LABELS))
     return my_pt.filter(~pl.col('desigConfidence').is_in(_COMPLETE_LABELS))
 
-async def desig_expander(my_pt, region="US", dates=None, frames=None, desig_only=True, **kwargs):
-    low = frames.get('desig_low') if frames else None
-    if (low is None) or (low.hyper.is_empty()): return
-    tickers = low.hyper.ul('ticker')
-    dates = latest_biz_date(dates, True)
-    triplet = construct_panoproxy_triplet(region, 'bondpositions', dates)
-    rt = region.title()
-    cols = ['netPosition:position', 'traderId:lower[traderId]', 'deskType', 'deskName']
-    cols = kdb_col_select_helper(cols, "last")
-    filters = {"ticker": tickers}
-    if desig_only:
-        filters['desig'] = 1
-    q1 = build_pt_query(triplet, cols, dates, {'return_today': False}, filters, by=['bookId', 'securityAltId3'])
+async def desig_expander(my_pt, region="US", dates=None, frames=None, **kwargs):
+    """Re-export of the orchestrator from `desig_expansion.py`. The
+    previous in-line stub here built a per-ticker query but never
+    returned the result frame -- it was effectively dead code. The new
+    implementation runs a second `apply_waterfall` round against a
+    firm-wide PANOPROXY universe (cached 12h) and resolves each
+    trader's main book via `book_maps`. See `desig_expansion.py` for
+    the full design rationale.
+    """
+    from app.services.loaders.desig_expansion import desig_expander as _impl
+    return await _impl(my_pt, region=region, dates=dates, frames=frames, **kwargs)
 
-    cols = ['Ticker', 'RatingCombined', 'IssuerCountry', 'maturityDate:CurrentMaturityDate', 'IndustryGroup', 'Currency']
-    q2 = build_pt_query(
-        '.mt.get[`.credit.refData]',
-        kdb_col_select_helper(cols, "last"),
-        dates, {'return_today': False},
-        filters = "isin in (exec isin from bp)",
-        raw_filter=True,
-        by=['isin']
+
+async def desig_expanded_splitter(my_pt, region="US", dates=None, frames=None, **kwargs):
+    """Merge expansion-derived HIGH/P1/P2 desigs onto main, never
+    overwriting an ISIN already resolved by the portfolio round.
+    See `desig_expansion.py`.
+    """
+    from app.services.loaders.desig_expansion import (
+        desig_expanded_splitter as _impl,
     )
-    # q = '{bp:%s;ref:%s;(`isin xkey bp) lj (`isin xkey ref)}[]' % (q1, q2)
-    q = '{bp:select netPosition, traderId, deskType, deskName, isin:securityAltId3, bookId from (%s);ref:%s;(`isin xkey bp) lj (`isin xkey ref)}[]' % (q1, q2)
-    res = await query_kdb(q, PANOPROXY)
-    bm = await book_maps()
-    enres = (await coalesce_left_join(res, bm, on = 'bookId')).rename({
-        'traderFirstName': 'desigFirstName',
-        'traderLastName': 'desigLastName',
-        'traderName': 'desigName',
-        'traderRegion': 'desigRegion',
-        'traderId': 'desigTraderId',
-        'bookId': 'desigBookId'
-    })
+    return await _impl(my_pt, region=region, dates=dates, frames=frames, **kwargs)
 
 
 
