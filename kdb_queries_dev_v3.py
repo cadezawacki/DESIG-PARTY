@@ -6154,17 +6154,57 @@ async def desig_waterfall_portfolio(my_pt, region="US", dates=None, frames=None,
     return joined
 
 
+_DESIG_SPLITTER_HIGH_COLS = [
+    'isin', 'desigBookId', 'desigTraderId', 'desigName', 'desigRegion',
+    'desigConfidence', 'desigGapRatio', 'desigScore', 'deskAsset',
+]
+
+
+def _is_empty_frame(df) -> bool:
+    """True when a frame is None, empty, or has no columns at all.
+
+    The loader occasionally hands splitters a zero-column DataFrame when
+    an upstream task returned None (e.g., pano_positions timed out and
+    desig_waterfall_portfolio short-circuited). `.filter(pl.col(...))`
+    on such a frame raises ColumnNotFoundError with 'valid columns: []'
+    -- guarding up-front is the only safe thing to do.
+    """
+    if df is None:
+        return True
+    try:
+        if df.hyper.is_empty():
+            return True
+    except Exception:
+        pass
+    try:
+        # Zero-column frames are the specific pathology we're guarding.
+        if not df.hyper.fields:
+            return True
+    except Exception:
+        # If we can't introspect, assume non-empty and let downstream fail.
+        return False
+    return False
+
+
 async def desig_splitter_high(my_pt, region="US", dates=None, frames=None, **kwargs):
     from app.services.loaders.desigs_redux import _PROMOTABLE_LABELS
     _COMPLETE_LABELS = set(['HIGH_CONFIDENCE'] + list(_PROMOTABLE_LABELS))
-    return my_pt.filter(pl.col('desigConfidence').is_in(_COMPLETE_LABELS)).select([
-        'isin','desigBookId', 'desigTraderId', 'desigName', 'desigRegion',
-        'desigConfidence', 'desigGapRatio', 'desigScore', 'deskAsset'
-    ])
+    if _is_empty_frame(my_pt):
+        return None
+    if 'desigConfidence' not in my_pt.hyper.fields:
+        return None
+    return my_pt.filter(pl.col('desigConfidence').is_in(_COMPLETE_LABELS)).select(
+        [c for c in _DESIG_SPLITTER_HIGH_COLS if c in my_pt.hyper.fields]
+    )
+
 
 async def desig_splitter_low(my_pt, region="US", dates=None, frames=None, **kwargs):
     from app.services.loaders.desigs_redux import _PROMOTABLE_LABELS
     _COMPLETE_LABELS = set(['HIGH_CONFIDENCE'] + list(_PROMOTABLE_LABELS))
+    if _is_empty_frame(my_pt):
+        return None
+    if 'desigConfidence' not in my_pt.hyper.fields:
+        return None
     return my_pt.filter(~pl.col('desigConfidence').is_in(_COMPLETE_LABELS))
 
 async def desig_expander(my_pt, region="US", dates=None, frames=None, **kwargs):
