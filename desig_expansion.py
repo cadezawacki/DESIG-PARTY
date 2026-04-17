@@ -470,13 +470,16 @@ async def desig_expander(my_pt, region="US", dates=None, frames=None, **kwargs):
     low = frames.get('desig_low')
     joined = frames.get('desig_joined')
 
-    if low is None or low.hyper.is_empty():
+    if not _frame_usable(low):
+        # LOW basket is empty, missing, or has no schema. Nothing to
+        # expand against -- but this is routine (no LOW bonds is a
+        # perfectly valid outcome of tier 1 + portfolio waterfall).
         return None
 
     # Portfolio universe = the post-portfolio-waterfall HIGH/P1/P2 bonds.
     # This is what apply_waterfall's first round produced; we extend it.
     portfolio_universe = None
-    if joined is not None and not joined.hyper.is_empty():
+    if _frame_usable(joined):
         _UNIVERSE_LABELS = (
             {'HIGH_CONFIDENCE', 'MEDIUM_CONFIDENCE'}
             | set(_PROMOTABLE_LABELS)
@@ -525,6 +528,27 @@ async def desig_expander(my_pt, region="US", dates=None, frames=None, **kwargs):
     )
 
 
+def _frame_usable(df, required_col: str = 'desigConfidence') -> bool:
+    """Guard against zero-column frames handed down when an upstream
+    task returned None. Same pathology as `_is_empty_frame` in
+    kdb_queries_dev_v3.py -- duplicated here to avoid a circular import.
+    """
+    if df is None:
+        return False
+    try:
+        if df.hyper.is_empty():
+            return False
+    except Exception:
+        return False
+    try:
+        fields = df.hyper.fields
+    except Exception:
+        return False
+    if not fields:
+        return False
+    return required_col in fields
+
+
 async def desig_expanded_splitter(my_pt, region="US", dates=None, frames=None, **kwargs):
     """DataTask: merges expansion-derived HIGH/P1/P2 desigs onto main.
 
@@ -539,17 +563,22 @@ async def desig_expanded_splitter(my_pt, region="US", dates=None, frames=None, *
     expanded = frames.get('desig_expanded')
     joined = frames.get('desig_joined')
 
-    if expanded is None or expanded.hyper.is_empty():
+    if not _frame_usable(expanded):
         return None
 
     # ISINs already resolved by the portfolio round -- keep them
-    # untouched.
-    portfolio_resolved_isins = set()
-    if joined is not None and not joined.hyper.is_empty():
-        portfolio_resolved_isins = set(
-            joined.filter(pl.col('desigConfidence').is_in(list(_COMPLETE_LABELS)))
-                  .hyper.to_list('isin')
-        )
+    # untouched. Skip silently if `desig_joined` is empty or missing
+    # the confidence column; in that case nothing is "already resolved"
+    # so every expansion row is a candidate.
+    portfolio_resolved_isins: set = set()
+    if _frame_usable(joined):
+        try:
+            portfolio_resolved_isins = set(
+                joined.filter(pl.col('desigConfidence').is_in(list(_COMPLETE_LABELS)))
+                      .hyper.to_list('isin')
+            )
+        except Exception:
+            portfolio_resolved_isins = set()
 
     out = expanded.filter(
         pl.col('desigConfidence').is_in(list(_COMPLETE_LABELS))
