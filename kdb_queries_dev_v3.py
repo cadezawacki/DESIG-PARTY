@@ -6231,6 +6231,15 @@ async def desig_expanded_splitter(my_pt, region="US", dates=None, frames=None, *
     return await _impl(my_pt, region=region, dates=dates, frames=frames, **kwargs)
 
 
+async def desig_hard_override(my_pt, region="US", dates=None, frames=None, **kwargs):
+    """Terminal hard-override: overwrite desig fields on every bond
+    matching a configured rule, regardless of what the algorithmic
+    tiers decided. See `desig_overrides.py` for the rule schema.
+    """
+    from app.services.loaders.desig_overrides import desig_hard_override as _impl
+    return await _impl(my_pt, region=region, dates=dates, frames=frames, **kwargs)
+
+
 
 
 @hypercache.cached(ttl=timedelta(hours=12), deep={"my_pt": True}, primary_keys={'my_pt': ["isin"]}, key_params=['my_pt', 'bleed_liq_sources'])

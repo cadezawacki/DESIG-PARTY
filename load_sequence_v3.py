@@ -627,6 +627,40 @@ ref_data_tasks = [
             'deskAsset'      : pl.String,
         },
     ),
+    # ----------------------------------------------------------------
+    # Hard override: terminal, beats every algorithmic tier. Rules
+    # live in `desig_overrides.py::HARD_OVERRIDES`; empty by default
+    # so this task is a no-op until ops populates it. Pass an
+    # `overrides=[...]` kwarg here to use a different rule list
+    # without touching the default config.
+    # ----------------------------------------------------------------
+    DataTask(
+        task_name='desig_hard_override',
+        broadcast_name="Desigs - Hard Override",
+        func=desig_hard_override,
+        merge_key='isin',
+        strict_task_requirements=['desig_expanded_splitter'],
+        fromFrame='main',
+        isOptional=True,
+        use_cached_providers=False,
+        expected_col_provides={
+            'desigBookId'    : pl.String,
+            'desigTraderId'  : pl.String,
+            'desigName'      : pl.String,
+            'desigFirstName' : pl.String,
+            'desigLastName'  : pl.String,
+            'desigRegion'    : pl.String,
+            'desigConfidence': pl.String,
+            'desigGapRatio'  : pl.Float64,
+            'desigScore'     : pl.Float64,
+            'deskAsset'      : pl.String,
+            'topTradersIds'  : pl.List(pl.String),
+            'topScores'      : pl.List(pl.Float64),
+            'topBooks'       : pl.List(pl.String),
+            'topNames'       : pl.List(pl.String),
+            'topRegions'     : pl.List(pl.String),
+        },
+    ),
 ]
 
 funge_tasks = [
